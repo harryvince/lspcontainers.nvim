@@ -1,83 +1,31 @@
-Config = {
-  ensure_installed = {}
-}
+local utils = require("lspcontainers.utils")
+local config = require("lspcontainers.config")
+local supported_languages = require("lspcontainers.language_servers")
+local image = require("lspcontainers.image")
 
-local supported_languages = {
-  bashls = { image = "docker.io/lspcontainers/bash-language-server" },
-  clangd = { image = "docker.io/lspcontainers/clangd-language-server" },
-  denols = { image = "docker.io/lspcontainers/denols" },
-  dockerls = { image = "docker.io/lspcontainers/docker-language-server" },
-  gopls = {
-    cmd_builder = function (runtime, workdir, image, network)
-      local volume = workdir..":"..workdir..":z"
-      local env = vim.api.nvim_eval('environ()')
-      local gopath = env.GOPATH or env.HOME.."/go"
-      local gopath_volume = gopath..":"..gopath..":z"
+--- Setup function for lspcontainers.nvim
+---@param options lspcontainersConfig
+local function setup(options)
+  for key, value in pairs(options) do
+      config[key] = value
+  end
+end
 
-      local group_handle = io.popen("id -g")
-      local user_handle = io.popen("id -u")
-
-      local group_id = string.gsub(group_handle:read("*a"), "%s+", "")
-      local user_id = string.gsub(user_handle:read("*a"), "%s+", "")
-
-      group_handle:close()
-      user_handle:close()
-
-      local user = user_id..":"..group_id
-
-      if runtime == "docker" then
-      	network = "bridge"
-      elseif runtime == "podman" then
-		network = "slirp4netns"
-      end
-
-      return {
-        runtime,
-        "container",
-        "run",
-        "--env",
-        "GOPATH="..gopath,
-        "--interactive",
-        "--network="..network,
-        "--rm",
-        "--workdir="..workdir,
-        "--volume="..volume,
-        "--volume="..gopath_volume,
-        "--user="..user,
-        image
-      }
-    end,
-    image = "docker.io/lspcontainers/gopls",
-  },
-  graphql = { image = "docker.io/lspcontainers/graphql-language-service-cli" },
-  html = { image = "docker.io/lspcontainers/html-language-server" },
-  intelephense = { image = "docker.io/lspcontainers/intelephense" },
-  jsonls = { image = "docker.io/lspcontainers/json-language-server" },
-  omnisharp = { image = "docker.io/lspcontainers/omnisharp" },
-  powershell_es = { image = "docker.io/lspcontainers/powershell-language-server" },
-  prismals = { image = "docker.io/lspcontainers/prisma-language-server" },
-  pylsp = { image = "docker.io/lspcontainers/python-lsp-server" },
-  pyright = { image = "docker.io/lspcontainers/pyright-langserver" },
-  rust_analyzer = { image = "docker.io/lspcontainers/rust-analyzer" },
-  solargraph = { image = "docker.io/lspcontainers/solargraph" },
-  lua_ls = { image = "docker.io/lspcontainers/lua-language-server" },
-  svelte = { image = "docker.io/lspcontainers/svelte-language-server" },
-  tailwindcss= { image = "docker.io/lspcontainers/tailwindcss-language-server" },
-  terraformls = { image = "docker.io/lspcontainers/terraform-ls" },
-  tsserver = { image = "docker.io/lspcontainers/typescript-language-server" },
-  vuels = { image = "docker.io/lspcontainers/vue-language-server" },
-  yamlls = { image = "docker.io/lspcontainers/yaml-language-server" },
-}
-
--- default command to run the lsp container
-local default_cmd = function (runtime, workdir, image, network, docker_volume)
+-- Default command to run an lsp container
+---@param runtime string -- Runtime for the container
+---@param workdir string -- Working directory to start the container in
+---@param image_name string -- Image to run
+---@param network string -- Network to run container in
+---@param volume string -- Volume to attach to the container
+---@return table<string> -- Command to run container
+local default_cmd = function (runtime, workdir, image_name, network, volume)
   if vim.loop.os_uname().sysname == "Windows_NT" then
-    workdir = Dos2UnixSafePath(workdir)
+    workdir = utils.Dos2UnixSafePath(workdir)
   end
 
   local mnt_volume
-  if docker_volume ~= nil then
-    mnt_volume ="--volume="..docker_volume..":"..workdir..":z"
+  if volume ~= nil then
+    mnt_volume ="--volume="..volume..":"..workdir..":z"
   else
     mnt_volume = "--volume="..workdir..":"..workdir..":z"
   end
@@ -91,14 +39,17 @@ local default_cmd = function (runtime, workdir, image, network, docker_volume)
     "--network="..network,
     "--workdir="..workdir,
     mnt_volume,
-    image
+    image_name
   }
 end
 
+---Validation on language server and and parse user options
+---@param server string -- The language server to run
+---@param user_opts table -- User options for command
 local function command(server, user_opts)
   -- Start out with the default values:
   local opts =  {
-    container_runtime = "docker",
+    container_runtime = config.driver,
     root_dir = vim.fn.getcwd(),
     cmd_builder = default_cmd,
     network = "none",
@@ -123,85 +74,18 @@ local function command(server, user_opts)
   return opts.cmd_builder(opts.container_runtime, opts.root_dir, opts.image, opts.network, opts.docker_volume)
 end
 
-Dos2UnixSafePath = function(workdir)
-  workdir = string.gsub(workdir, ":", "")
-  workdir = string.gsub(workdir, "\\", "/")
-  workdir = "/" .. workdir
-  return workdir
-end
+image.create_user_commands()
 
-local function on_event(_, data, event)
-  --if event == "stdout" or event == "stderr" then
-  if event == "stdout" then
-    if data then
-      for _, v in pairs(data) do
-        print(v)
-      end
-    end
-  end
-end
-
-local function images_pull(runtime)
-  local jobs = {}
-  if not (type(runtime) == "string") then runtime = "docker" end
-
-  for idx, server_name in ipairs(Config.ensure_installed) do
-    local server = supported_languages[server_name]
-
-    local job_id =
-      vim.fn.jobstart(
-      runtime.." image pull "..server['image'],
-      {
-        on_stderr = on_event,
-        on_stdout = on_event,
-        on_exit = on_event,
-      }
-    )
-
-    table.insert(jobs, idx, job_id)
-  end
-
-  local _ = vim.fn.jobwait(jobs)
-
-  print("lspcontainers: Language servers successfully pulled")
-end
-
-local function images_remove(runtime)
-  local jobs = {}
-  if not (type(runtime) == "string") then runtime = "docker" end
-
-  for _, v in pairs(supported_languages) do
-    local job =
-      vim.fn.jobstart(
-      runtime.." image rm --force "..v['image']..":latest",
-      {
-        on_stderr = on_event,
-        on_stdout = on_event,
-        on_exit = on_event,
-      }
-    )
-
-    table.insert(jobs, job)
-  end
-
-  local _ = vim.fn.jobwait(jobs)
-
-  print("lspcontainers: All language servers removed")
-end
-
-vim.api.nvim_create_user_command("LspImagesPull", images_pull, {})
-vim.api.nvim_create_user_command("LspImagesRemove", images_remove, {})
-
-local function setup(options)
-  if options['ensure_installed'] then
-    Config.ensure_installed = options['ensure_installed']
-  end
-end
-
+---@class lspcontainers
+---@field command function -- Command to run container
+---@field images_pull function -- Pull all supported images
+---@field images_remove function -- Remove all supported images
+---@field setup function -- Setup function
+---@field supported_languages LanguageServers -- lspcontainers supported language servers
 return {
   command = command,
-  images_pull = images_pull,
-  images_remove = images_remove,
+  images_pull = image.images_pull,
+  images_remove = image.images_remove,
   setup = setup,
   supported_languages = supported_languages
 }
